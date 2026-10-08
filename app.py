@@ -11,12 +11,27 @@ import io
 import json
 import os
 import re
+import zipfile
+import xml.etree.ElementTree as ET
 
 import streamlit as st
-from docx import Document
-from google import genai
-from google.genai import types
-from pypdf import PdfReader
+
+st.set_page_config(page_title="AI ATS Resume Checker", page_icon="📄", layout="centered")
+
+# Third-party imports are guarded so a missing package shows a clear message
+# in the app instead of a cryptic crash.
+_MISSING = []
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    genai = types = None
+    _MISSING.append("google-genai")
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
+    _MISSING.append("pypdf")
 
 # --------------------------------------------------------------------------
 # Config
@@ -28,8 +43,6 @@ DEFAULT_MODEL = "gemini-flash-latest"
 MAX_FILE_MB = 5
 MAX_RESUME_CHARS = 20_000  # keeps prompts small and cheap
 MIN_RESUME_CHARS = 150     # below this the file is probably scanned/empty
-
-st.set_page_config(page_title="AI ATS Resume Checker", page_icon="📄", layout="centered")
 
 
 # --------------------------------------------------------------------------
@@ -60,16 +73,40 @@ def extract_text_from_pdf(data: bytes) -> str:
     return "\n".join(pages)
 
 
+_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_MC_FALLBACK = "{http://schemas.openxmlformats.org/markup-compatibility/2006}Fallback"
+
+
+def _collect_paragraphs(node, out):
+    """Walk the DOCX XML in document order (covers body, tables and text boxes)."""
+    if node.tag == _MC_FALLBACK:  # duplicate copy of text boxes - skip
+        return
+    if node.tag == _W + "p":
+        parts = []
+        for el in node.iter():
+            if el.tag == _W + "t" and el.text:
+                parts.append(el.text)
+            elif el.tag in (_W + "tab", _W + "br"):
+                parts.append(" ")
+        line = "".join(parts).strip()
+        if line:
+            out.append(line)
+        return
+    for child in node:
+        _collect_paragraphs(child, out)
+
+
 def extract_text_from_docx(data: bytes) -> str:
-    doc = Document(io.BytesIO(data))
-    parts = [p.text for p in doc.paragraphs if p.text.strip()]
-    # Resumes often keep content in tables (skills grids, two-column layouts)
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                if cell.text.strip():
-                    parts.append(cell.text)
-    return "\n".join(parts)
+    """Read .docx using only the standard library (no python-docx needed)."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            xml_bytes = z.read("word/document.xml")
+    except (zipfile.BadZipFile, KeyError):
+        raise ValueError("This does not look like a valid .docx file.")
+    root = ET.fromstring(xml_bytes)
+    lines = []
+    _collect_paragraphs(root, lines)
+    return "\n".join(lines)
 
 
 def extract_resume_text(filename: str, data: bytes) -> str:
@@ -359,6 +396,14 @@ def render_results(result: dict, checks: list) -> None:
 def main() -> None:
     st.title("📄 AI Resume ATS Checker")
     st.caption("Upload your resume and get an ATS score with specific ways to improve it.")
+
+    if _MISSING:
+        st.error(
+            "Missing Python package(s): **" + ", ".join(_MISSING) + "**.\n\n"
+            "Make sure a file named exactly `requirements.txt` (with an **s**) is in the ROOT "
+            "of your GitHub repo, next to `app.py`, then reboot the app."
+        )
+        st.stop()
 
     api_key = get_secret("GEMINI_API_KEY")
     model = get_secret("GEMINI_MODEL", DEFAULT_MODEL)
