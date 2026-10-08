@@ -10,7 +10,9 @@ Run locally:  streamlit run app.py
 import io
 import json
 import os
+import random
 import re
+import time
 import zipfile
 import xml.etree.ElementTree as ET
 
@@ -40,6 +42,11 @@ except ImportError:
 # model. You can pin a specific one (e.g. "gemini-2.5-flash") via the
 # GEMINI_MODEL secret / environment variable.
 DEFAULT_MODEL = "gemini-flash-latest"
+# If the main model is overloaded (503) the app retries, then tries these in order.
+FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-flash-lite-latest"]
+PRIMARY_ATTEMPTS = 4      # attempts on the chosen model
+FALLBACK_ATTEMPTS = 2     # attempts on each fallback model
+MAX_BACKOFF_SECONDS = 12
 MAX_FILE_MB = 5
 MAX_RESUME_CHARS = 20_000  # keeps prompts small and cheap
 MIN_RESUME_CHARS = 150     # below this the file is probably scanned/empty
@@ -297,17 +304,77 @@ def parse_model_json(raw: str) -> dict:
     }
 
 
-def analyze_resume(api_key: str, model: str, resume_text: str, job_description: str, target_role: str) -> dict:
-    client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=model,
-        contents=build_prompt(resume_text, job_description, target_role),
-        config=types.GenerateContentConfig(
-            temperature=0.2,
-            response_mime_type="application/json",
-        ),
+def _error_code(exc: Exception):
+    """Best-effort extraction of an HTTP status code from an SDK exception."""
+    for attr in ("code", "status_code"):
+        val = getattr(exc, attr, None)
+        if isinstance(val, int):
+            return val
+    match = re.search(r"\b([45]\d\d)\b", str(exc)[:300])
+    return int(match.group(1)) if match else None
+
+
+def is_retryable(exc: Exception) -> bool:
+    """Temporary problems worth retrying: overload, rate limit, timeouts, bad/blocked output."""
+    if isinstance(exc, ValueError):  # model returned unparsable / empty output
+        return True
+    if _error_code(exc) in (429, 500, 502, 503, 504):
+        return True
+    text = str(exc).lower()
+    return any(
+        k in text
+        for k in ("unavailable", "overloaded", "high demand", "resource_exhausted",
+                  "deadline", "timed out", "timeout", "connection", "try again")
     )
-    return parse_model_json(response.text)
+
+
+def is_model_missing(exc: Exception) -> bool:
+    return _error_code(exc) == 404 or "not found" in str(exc).lower()
+
+
+def analyze_resume(api_key, model, resume_text, job_description, target_role, notify=None, sleep=time.sleep):
+    """
+    Call Gemini with automatic retries (exponential backoff) and model fallback.
+    Returns the parsed result dict, with the model actually used in result["model_used"].
+    """
+    client = genai.Client(api_key=api_key)
+    prompt = build_prompt(resume_text, job_description, target_role)
+    config = types.GenerateContentConfig(temperature=0.2, response_mime_type="application/json")
+
+    models = []
+    for m in [model] + FALLBACK_MODELS:  # de-duplicate, keep order
+        if m and m not in models:
+            models.append(m)
+
+    last_error = None
+    for index, current in enumerate(models):
+        attempts = PRIMARY_ATTEMPTS if index == 0 else FALLBACK_ATTEMPTS
+        for attempt in range(1, attempts + 1):
+            try:
+                response = client.models.generate_content(model=current, contents=prompt, config=config)
+                result = parse_model_json(response.text)
+                result["model_used"] = current
+                return result
+            except Exception as exc:  # noqa: BLE001 - we classify below
+                last_error = exc
+                if is_model_missing(exc):
+                    break  # this model name doesn't exist -> go to next model
+                if not is_retryable(exc):
+                    raise  # e.g. invalid API key, bad request: retrying won't help
+                if attempt < attempts:
+                    wait = min(MAX_BACKOFF_SECONDS, 2 ** attempt) + random.uniform(0, 1)
+                    if notify:
+                        notify(f"Gemini is busy ({current}). Retrying in {wait:.0f}s "
+                               f"(attempt {attempt + 1}/{attempts})...")
+                    sleep(wait)
+                elif notify and index + 1 < len(models):
+                    notify(f"{current} is still busy. Switching to {models[index + 1]}...")
+
+    raise RuntimeError(
+        "Gemini is overloaded right now and all models were busy. "
+        "This is temporary on Google's side - please try again in a minute or two. "
+        f"(Last error: {last_error})"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -335,6 +402,8 @@ def render_results(result: dict, checks: list) -> None:
         st.progress(score / 100)
     if result["summary"]:
         st.write(result["summary"])
+    if result.get("model_used"):
+        st.caption(f"Analyzed with {result['model_used']}")
 
     st.markdown("### 📊 Score breakdown")
     labels = {
@@ -452,10 +521,16 @@ def main() -> None:
             )
             st.stop()
 
+        status = st.empty()
         try:
             with st.spinner("Analyzing with Gemini..."):
-                result = analyze_resume(api_key, model, text, job_description, target_role)
+                result = analyze_resume(
+                    api_key, model, text, job_description, target_role,
+                    notify=lambda msg: status.info(msg),
+                )
+            status.empty()
         except Exception as exc:
+            status.empty()
             st.error(f"Analysis failed: {exc}")
             st.stop()
 
